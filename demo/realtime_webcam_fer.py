@@ -2,30 +2,27 @@
 demo/realtime_webcam_fer.py
 
 Purpose:
-    Real-time webcam FER demo based on the RAVDESS-trained CNN-LSTM.
-    Uses MediaPipe BlazeFace to detect the face, maintains a rolling
-    buffer of the last SEQ_LEN face crops, and runs one clip-level
-    forward pass per frame for 7-class emotion classification. An EMA
-    smooths the predicted probability over time so the label does not
-    flicker. Overlays bbox + label + confidence + top-left FPS +
-    top-right 128x128 grayscale input preview on the video frame.
+    Real-time webcam FER demo based on the FER2013-trained ShallowCNN48
+    (Model 1 in the report). Uses MediaPipe BlazeFace to detect the face
+    and runs one single-frame forward pass per webcam tick for 7-class
+    emotion classification. An EMA smooths the predicted probability
+    over time so the label does not flicker. Overlays bbox + label +
+    confidence + top-left FPS + top-right 48x48 grayscale input preview
+    on the video frame.
 
 Pipeline:
     - Open the local webcam (CAMERA_ID = 0).
     - Detect faces with MediaPipe BlazeFace (blaze_face_short_range.tflite).
     - Keep the single face with the highest detection score.
-    - Expand the bbox by 1.25x, crop, and convert to 128x128 grayscale.
-    - Append the tensor to a deque of length BUFFER_LEN (raw buffer).
-      Once the deque holds >= SEQ_LEN frames, uniformly sub-sample
-      SEQ_LEN frames via torch.linspace and run CNNLSTM128 forward on
-      the stacked clip [1, T, 1, H, W]. This mirrors the training-time
-      sampling density in training/train_ravdess_cnn_lstm.py so the
-      temporal stride roughly matches what the model is used to.
-    - EMA-smooth the per-class probability and display the top-1 class.
+    - Expand the bbox by 1.25x, crop, and convert to 48x48 grayscale
+      following the FER2013 test-time transform (Grayscale -> Resize ->
+      ToTensor, no normalization, to match training/train_fer2013_shallow_cnn48.py).
+    - Forward through ShallowCNN48, take softmax, EMA-smooth the
+      per-class probability and display the top-1 class.
     - Press q or Esc to quit.
 
 Input:
-    best_ravdess_cnn_lstm.pth              CNN-LSTM weights trained on RAVDESS frames.
+    best_fer2013_shallow_cnn48.pt          ShallowCNN48 weights trained on FER2013.
     blaze_face_short_range.tflite          Pretrained MediaPipe face detector.
     Local webcam (CAMERA_ID = 0).
 
@@ -37,7 +34,6 @@ Usage (run from project root):
 """
 
 import time
-from collections import deque
 from pathlib import Path
 
 import cv2
@@ -59,234 +55,147 @@ from mediapipe.tasks.python import vision
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
-MODEL_PATH = str(PROJECT_ROOT / "weights" / "best_ravdess_cnn_lstm.pth")
+MODEL_PATH = str(PROJECT_ROOT / "weights" / "best_fer2013_shallow_cnn48.pt")
 MP_FACE_DETECTOR_MODEL = str(PROJECT_ROOT / "assets" / "blaze_face_short_range.tflite")   # MediaPipe face detector .task file
 CAMERA_ID = 0
 
-IMG_SIZE = 128
-SEQ_LEN = 8           # frames fed into the CNN-LSTM per forward pass
-BUFFER_LEN = 8        # raw face-crop buffer; equals SEQ_LEN = consecutive 8 frames.
-                      # Tried 24 (linspace down to 8 to match training-stride ~3),
-                      # but it pushed the model into a "disgust" attractor on
-                      # webcam input. Keeping 8 = 8 consecutive frames as the
-                      # stable default; bump up again only if combined with
-                      # subject conditioning or a domain-adapted encoder.
-FEAT_DIM = 256
-HIDDEN_DIM = 256
-BIDIRECTIONAL = True
+IMG_SIZE = 48         # ShallowCNN48 expects 48x48 grayscale input.
+NUM_CLASSES = 7
 
 EMA_ALPHA = 0.3       # new prediction weight for exponential moving average
-FACE_MISS_RESET = 15  # consecutive face-miss frames to drop the buffer
+FACE_MISS_RESET = 15  # consecutive face-miss frames to reset the EMA
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Must match training sorted() order (alphabetical).
+# Must match training sorted() order from datasets.ImageFolder (alphabetical).
+# FER2013 uses "fear"/"surprise" (not "fearful"/"surprised" like RAVDESS).
 CLASS_NAMES = [
     "angry",
     "disgust",
-    "fearful",
+    "fear",
     "happy",
     "neutral",
     "sad",
-    "surprised",
+    "surprise",
 ]
 
 BOX_COLOR = (0, 255, 0)
 TEXT_COLOR = (0, 255, 0)
-WARMUP_COLOR = (0, 200, 255)
 FACE_PREVIEW_SIZE = 160  # Top-right preview size for the model's input face image.
 
 
 # =========================================================
-# 2. CNN-LSTM model (mirrors training/train_ravdess_cnn_lstm.py)
+# 2. ShallowCNN48 model (mirrors training/train_fer2013_shallow_cnn48.py)
 # =========================================================
 
-class VGGStyleCNN128Encoder(nn.Module):
-    def __init__(self, in_channels=1, feat_dim=256):
+class ShallowCNN48(nn.Module):
+    """
+    Shallow 4-stage CNN for 48x48 grayscale FER2013 input.
+
+    - Single Conv per stage (Conv + BN + ReLU + MaxPool).
+    - Channels: 32 -> 64 -> 128 -> 256.
+    - No feature-map dropout.
+    - Feature map is flattened directly (no adaptive pool), so the input
+      resolution is hard-coded to 48x48.
+    - ~1.0M parameters.
+    """
+
+    def __init__(self, num_classes=7):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),   # 48x48
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                              # 24x24
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),  # 24x24
             nn.BatchNorm2d(64),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.25),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                              # 12x12
 
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1), # 12x12
             nn.BatchNorm2d(128),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(128),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.25),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                              # 6x6
 
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1), # 6x6
             nn.BatchNorm2d(256),
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(256),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.25),
-
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(512),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.BatchNorm2d(512),
-            nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.25),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                               # 3x3
         )
-
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((2, 2))
-        self.proj = nn.Linear(512 * 2 * 2, feat_dim)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.adaptive_pool(x)
-        x = x.flatten(1)
-        x = self.proj(x)
-        return x
-
-
-class AttentionPool(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.attn = nn.Linear(in_dim, 1)
-
-    def forward(self, x):
-        scores = self.attn(x)
-        weights = torch.softmax(scores, dim=1)
-        return (x * weights).sum(dim=1)
-
-
-class CNNLSTM128(nn.Module):
-    def __init__(
-        self,
-        num_classes=7,
-        in_channels=1,
-        feat_dim=256,
-        hidden_dim=256,
-        num_layers=1,
-        bidirectional=True,
-        dropout=0.3,
-    ):
-        super().__init__()
-
-        self.encoder = VGGStyleCNN128Encoder(in_channels=in_channels, feat_dim=feat_dim)
-
-        self.lstm = nn.LSTM(
-            input_size=feat_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=bidirectional,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
-        temporal_dim = hidden_dim * 2 if bidirectional else hidden_dim
-        self.pool = AttentionPool(temporal_dim)
 
         self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(temporal_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
+            nn.Flatten(),
+            nn.Linear(256 * 3 * 3, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
-        b, t, c, h, w = x.shape
-        x = x.view(b * t, c, h, w)
-        feats = self.encoder(x)
-        feats = feats.view(b, t, -1)
-        seq_out, _ = self.lstm(feats)
-        pooled = self.pool(seq_out)
-        return self.classifier(pooled)
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
 
 
 # =========================================================
 # 3. Preprocessing
 # =========================================================
 
-# Match training-time transform: grayscale, 128x128, normalize to ~[-1, 1].
+# Match training-time test transform exactly: grayscale, 48x48, ToTensor.
+# NOTE: training script does NOT normalize beyond ToTensor() (which maps
+# uint8 -> [0, 1]). Any extra Normalize() here would silently shift the
+# input distribution and confuse the BN statistics.
 frame_transform = transforms.Compose([
     transforms.Grayscale(num_output_channels=1),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5]),
 ])
 
 
-def load_cnn_lstm_model():
-    model = CNNLSTM128(
-        num_classes=len(CLASS_NAMES),
-        in_channels=1,
-        feat_dim=FEAT_DIM,
-        hidden_dim=HIDDEN_DIM,
-        num_layers=1,
-        bidirectional=BIDIRECTIONAL,
-        dropout=0.3,
-    ).to(DEVICE)
-
+def load_shallow_cnn_model():
+    model = ShallowCNN48(num_classes=NUM_CLASSES).to(DEVICE)
     state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
     return model
 
 
-def preprocess_face_for_buffer(face_bgr):
+def preprocess_face(face_bgr):
     """
     face_bgr: cropped face in OpenCV BGR format.
     Returns:
-        frame_tensor: [1, IMG_SIZE, IMG_SIZE] normalized tensor.
+        frame_tensor: [1, IMG_SIZE, IMG_SIZE] tensor in [0, 1].
         gray_input_uint8: [IMG_SIZE, IMG_SIZE] uint8 grayscale preview
-            (the un-normalized version of what the model sees).
+            (what the model actually sees).
     """
     face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(face_rgb)
 
-    x = frame_transform(pil_img)   # [1, H, W], normalized
+    x = frame_transform(pil_img)   # [1, H, W], in [0, 1]
 
-    # For the on-screen preview, un-normalize back to [0, 255].
-    preview = ((x.squeeze(0).cpu().numpy() * 0.5) + 0.5) * 255.0
+    # For the on-screen preview, scale back to [0, 255].
+    preview = x.squeeze(0).cpu().numpy() * 255.0
     gray_input = preview.clip(0, 255).astype(np.uint8)
 
     return x, gray_input
 
 
 @torch.no_grad()
-def predict_clip_emotion(model, frame_buffer):
+def predict_frame_emotion(model, frame_tensor):
     """
-    Uniformly sub-sample SEQ_LEN frames from `frame_buffer` via
-    torch.linspace and run one clip-level forward pass. This matches
-    training-time sampling in RAVDESSSequenceDataset._sample_frames.
+    Run a single 48x48 grayscale face tensor through ShallowCNN48.
 
-    frame_buffer: a deque/list of >=SEQ_LEN normalized frame tensors,
-                  each [1, H, W].
+    frame_tensor: [1, H, W] tensor in [0, 1].
     Returns:
         probs: numpy array [num_classes] of softmax probabilities.
     """
-    buffer_list = list(frame_buffer)
-    n = len(buffer_list)
-
-    if n >= SEQ_LEN:
-        indices = torch.linspace(0, n - 1, steps=SEQ_LEN).long().tolist()
-        selected = [buffer_list[i] for i in indices]
-    else:
-        # Defensive fallback (caller should guarantee n >= SEQ_LEN).
-        selected = list(buffer_list)
-        while len(selected) < SEQ_LEN:
-            selected.append(buffer_list[-1])
-
-    clip = torch.stack(selected, dim=0)              # [T, 1, H, W]
-    clip = clip.unsqueeze(0).to(DEVICE)              # [1, T, 1, H, W]
-
-    logits = model(clip)
+    x = frame_tensor.unsqueeze(0).to(DEVICE)  # [1, 1, H, W]
+    logits = model(x)
     probs = torch.softmax(logits, dim=1).squeeze(0)
     return probs.cpu().numpy()
 
@@ -334,25 +243,22 @@ def create_face_detector():
 
 def main():
     print("Using device:", DEVICE)
-    print("Loading CNN-LSTM model from:", MODEL_PATH)
+    print("Loading ShallowCNN48 model from:", MODEL_PATH)
     print("Loading MediaPipe model from:", MP_FACE_DETECTOR_MODEL)
-    print(f"Raw buffer length: {BUFFER_LEN} frames | Clip length: {SEQ_LEN} frames")
+    print(f"Input size: {IMG_SIZE}x{IMG_SIZE} grayscale | classes: {CLASS_NAMES}")
 
     if not Path(MODEL_PATH).exists():
-        raise FileNotFoundError(f"CNN-LSTM model not found: {MODEL_PATH}")
+        raise FileNotFoundError(f"ShallowCNN48 model not found: {MODEL_PATH}")
     if not Path(MP_FACE_DETECTOR_MODEL).exists():
         raise FileNotFoundError(f"MediaPipe model not found: {MP_FACE_DETECTOR_MODEL}")
 
-    model = load_cnn_lstm_model()
+    model = load_shallow_cnn_model()
     detector = create_face_detector()
 
     cap = cv2.VideoCapture(CAMERA_ID)
     if not cap.isOpened():
         raise RuntimeError("Cannot open webcam")
 
-    # Rolling buffer of the last BUFFER_LEN face tensors. Each inference
-    # uniformly sub-samples SEQ_LEN frames from this buffer.
-    frame_buffer = deque(maxlen=BUFFER_LEN)
     ema_probs = None
     miss_counter = 0
 
@@ -380,6 +286,7 @@ def main():
             best_face_preview = None
             face_found = False
             current_bbox = None
+            new_probs = None
 
             if detection_result.detections:
                 # Keep only the face with the highest detection score.
@@ -399,8 +306,8 @@ def main():
                 face_crop = frame[y1:y2, x1:x2]
 
                 if face_crop.size > 0:
-                    face_tensor, gray_input = preprocess_face_for_buffer(face_crop)
-                    frame_buffer.append(face_tensor)
+                    face_tensor, gray_input = preprocess_face(face_crop)
+                    new_probs = predict_frame_emotion(model, face_tensor)
                     face_found = True
                     miss_counter = 0
                     current_bbox = (x1, y1, x2, y2)
@@ -413,19 +320,12 @@ def main():
 
             if not face_found:
                 miss_counter += 1
-                # If face has been missing for a while, drop the buffer so
-                # stale frames do not poison the next prediction.
+                # If face has been missing for a while, drop the EMA so
+                # stale probabilities do not linger.
                 if miss_counter >= FACE_MISS_RESET:
-                    frame_buffer.clear()
                     ema_probs = None
 
-            # Run clip-level inference once the raw buffer holds at least
-            # SEQ_LEN frames; the sub-sampler will pick SEQ_LEN uniformly
-            # spaced frames across whatever is currently buffered (up to
-            # BUFFER_LEN).
-            if len(frame_buffer) >= SEQ_LEN:
-                new_probs = predict_clip_emotion(model, frame_buffer)
-
+            if new_probs is not None:
                 if ema_probs is None:
                     ema_probs = new_probs
                 else:
@@ -448,24 +348,8 @@ def main():
                         2,
                         cv2.LINE_AA,
                     )
-            else:
-                # Still warming up: show how many frames we have.
-                if current_bbox is not None:
-                    x1, y1, x2, y2 = current_bbox
-                    cv2.rectangle(display, (x1, y1), (x2, y2), WARMUP_COLOR, 2)
 
-                cv2.putText(
-                    display,
-                    f"Warming up temporal buffer {len(frame_buffer)}/{SEQ_LEN} (raw {len(frame_buffer)}/{BUFFER_LEN})",
-                    (10, img_h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    WARMUP_COLOR,
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            # Top-right preview of the 128x128 grayscale face the model sees.
+            # Top-right preview of the 48x48 grayscale face the model sees.
             if best_face_preview is not None:
                 preview_bgr = cv2.cvtColor(best_face_preview, cv2.COLOR_GRAY2BGR)
                 ph, pw = preview_bgr.shape[:2]
@@ -497,7 +381,7 @@ def main():
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("Realtime FER (CNN-LSTM) with MediaPipe", display)
+            cv2.imshow("Realtime FER (ShallowCNN48 / FER2013) with MediaPipe", display)
 
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):

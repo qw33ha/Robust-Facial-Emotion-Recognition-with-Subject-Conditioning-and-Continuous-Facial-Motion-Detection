@@ -32,9 +32,7 @@ After unzipping, the project root should contain `FER2013/` and `RAVDESS/` direc
 ├── weights/                         # Best checkpoints produced by training
 ├── outputs/                         # Confusion matrices, curves, JSON results
 ├── demo/
-│   ├── realtime_webcam_fer.py              # Model 3 (no residue)
-│   ├── realtime_webcam_model5.py           # Model 5 (pure residue, with enrollment)
-│   └── realtime_webcam_model5b.py          # Model 5b (residue-concat, with enrollment)
+│   └── realtime_webcam_fer.py              # Model 1 (ShallowCNN48 on FER2013)
 └── assets/
 ```
 
@@ -296,63 +294,27 @@ Outputs:
 
 ## Real time demo
 
-Three webcam demos are provided, one per architecture, so you can watch the effect of subject-residue conditioning (and of the pure-vs-concat residue choice) live against the non-conditioned baseline.
+A single webcam demo is provided for Model 1, the FER2013-trained ShallowCNN48. It is intended as a live sanity check on a statically-trained image classifier — not as an end-user application.
 
-**Demo A — Model 3 (no residue):**
 ```bash
 python demo/realtime_webcam_fer.py
 ```
-Loads `weights/best_ravdess_cnn_lstm.pth`, runs MediaPipe BlazeFace for face detection, maintains a rolling 8-frame buffer, feeds it to the warm-started + frozen CNN-LSTM, and overlays an EMA-smoothed softmax bar chart. Good for a quick sanity check on the non-residue baseline.
 
-**Demo B — Model 5 (subject-residue, with live enrollment):**
-```bash
-python demo/realtime_webcam_model5.py
-```
-Loads `weights/best_ravdess_cnn_lstm_residue.pth`. Because the residue model needs a per-subject neutral template to subtract, the demo exposes three template modes:
+Loads `weights/best_fer2013_shallow_cnn48.pt`. On each tick the demo reads a frame from the local webcam (`CAMERA_ID = 0`), runs MediaPipe BlazeFace (`assets/blaze_face_short_range.tflite`) to locate the largest face, expands the bounding box by `1.25x`, crops, and converts to a `48x48` grayscale tensor using the exact FER2013 test-time transform (`Grayscale -> Resize -> ToTensor`, no normalization, to match `training/train_fer2013_shallow_cnn48.py`). One single-frame forward pass through ShallowCNN48 produces 7-class softmax probabilities. An exponential moving average (`EMA_ALPHA = 0.3`) smooths the probability over time, and the top-1 class is drawn over the bbox together with its confidence. The overlay also shows FPS and a `48x48` input preview in the top-right corner, which is useful for confirming that what the model actually sees looks like a reasonable face crop. There is no temporal buffer: each webcam frame produces one prediction independently, and the EMA only glues successive predictions together.
 
-- **GENERIC** (default at startup): the template is the population mean computed by encoding every neutral frame in `output_gray_frames/neutral/` through the checkpoint encoder once, capped at `GENERIC_MAX_FRAMES_PER_ACTOR` frames per actor. This is the "unknown user" fallback — the 24 RAVDESS actors are averaged into a single generic neutral.
-- **PERSONAL**: press **N** to start a ~3-second enrollment while holding a resting / neutral face; the demo encodes ~30 frames through the frozen encoder and averages them into a user-specific template. Progress bar + banner make the enrollment state obvious.
-- Press **R** to reset back to the GENERIC template.
+The FER2013 class ordering used by the demo is alphabetical — `angry, disgust, fear, happy, neutral, sad, surprise` — which is exactly what `torchvision.datasets.ImageFolder` produced at training time. Note the spelling: FER2013 uses `fear` / `surprise` (not RAVDESS's `fearful` / `surprised`).
 
-Key bindings during the demo:
-- **N** — start (or restart) personal enrollment
-- **R** — reset to GENERIC template
-- **[** — shrink crop (both dims proportionally)
-- **]** — grow crop (both dims proportionally)
-- **\\** — reset crop scales to defaults
-- **Q** — quit
+Controls:
 
-This matches the residue model's training protocol: the val-time template is a deterministic mean of neutral frames for the held-out actors, so a live personal enrollment is the closest possible analogue for a new user.
+- **Q** or **Esc** — quit.
 
-**Tuning the crop (important).** `preprocess/extract_ravdess_gray_frames.py` does NOT face-crop — it just grayscales and resizes the full RAVDESS video frame (head + shoulders + studio background). A tight BlazeFace-only crop at demo time is therefore a large distribution shift for the encoder, and on Model 5 it tends to collapse the classifier into a 2-class attractor (e.g. happy ↔ disgust). The demo consequently ships with an asymmetric, downward-biased expansion of the BlazeFace bbox — roughly `W × 2.2`, `H × 2.8`, with the crop center shifted ~30% of the face height downward — so the 128×128 input contains the whole head + neck + shoulders + some background, approximating RAVDESS framing.
+Known limitations (honest caveats):
 
-If the predictions still seem stuck, use `[` / `]` to adjust the crop live until the top-right 128×128 input preview looks like a RAVDESS-style head-and-shoulders shot (not a tight face close-up). The rolling frame buffer and EMA state are cleared on every scale change, so a fresh prediction starts after a short warm-up. Tune with `[` / `]` **before** enrolling with `N`, otherwise your personal neutral template will be computed under a crop different from the one you end up using for inference.
+- FER2013 is a small, label-noisy, 48×48 dataset scraped from the web; expect the usual FER2013-trained-classifier failure modes to transfer to the webcam, in particular `fear` under-recall (frequently pulled toward `sad` or `surprise`) and a general bias toward `happy` / `neutral` under neutral viewing conditions. The confusion matrix in `outputs/fer_confusion_matrix.png` is the best quantitative reference for which mistakes to expect live.
+- EMA smoothing dampens flicker but also locks the prediction in for a few frames after the face changes expression; expect a short lag between an expression and its label.
+- ShallowCNN48 is a single-image classifier, so quick micro-expressions that span only one or two frames will usually be averaged out by the EMA. If you want a snappier response, lower `EMA_ALPHA`; if you want a steadier label, raise it.
 
-> If `weights/best_ravdess_cnn_lstm_residue.pth` or the `output_gray_frames/neutral/` folder are missing, Demo B will fail to start. Train Model 5 (or copy its provided checkpoint into `weights/`) and make sure the grayscale preprocessing has been run first.
-
-**Demo C — Model 5b (subject-residue concat, with live enrollment) — recommended:**
-```bash
-python demo/realtime_webcam_model5b.py
-```
-Loads `weights/best_ravdess_cnn_lstm_residue_concat.pth`. Architecturally identical to Demo B except the BiLSTM input is the concatenation `[f_t, f_t − f_neutral]` (size `2 * feat_dim = 512`) instead of the pure residue (size `feat_dim = 256`). All template logic, key bindings, crop tuning, and enrollment behaviour are the same as Demo B:
-
-- **GENERIC** (default at startup): population mean over every neutral frame in `output_gray_frames/neutral/`, capped at `GENERIC_MAX_FRAMES_PER_ACTOR` per actor.
-- **PERSONAL**: press **N** to start ~3-second enrollment with a resting face; ~30 frames are encoded and averaged into a user-specific template.
-- Press **R** to revert to the GENERIC template.
-
-Key bindings during the demo (identical to Demo B):
-- **N** — start (or restart) personal enrollment
-- **R** — reset to GENERIC template
-- **[** — shrink crop (both dims proportionally)
-- **]** — grow crop (both dims proportionally)
-- **\\** — reset crop scales to defaults
-- **Q** — quit
-
-Why this is the recommended demo: in our offline evaluation, the pure-residue Model 5 produced very high recall on high-magnitude expressions (angry / happy ≈ 97%) but collapsed on low-magnitude ones (disgust ≈ 28%). Model 5b's concat fusion narrows that spread substantially (disgust recovers to ~66%) at a comparable overall val accuracy. On webcam input — which is itself a domain shift away from the full-frame RAVDESS training distribution — preserving the absolute feature magnitude alongside the subject-normalized direction makes the live predictions noticeably more stable, with fewer 2-class attractor lock-ups.
-
-The same crop-tuning advice from Demo B applies verbatim (the encoder was trained on full RAVDESS video frames, not face crops); use `[` / `]` to make the 128×128 input preview look like a head-and-shoulders shot before enrolling with `N`.
-
-> If `weights/best_ravdess_cnn_lstm_residue_concat.pth` or the `output_gray_frames/neutral/` folder are missing, Demo C will fail to start. Train Model 5b (or copy its provided checkpoint into `weights/`) and make sure the grayscale preprocessing has been run first.
+> If `weights/best_fer2013_shallow_cnn48.pt` or `assets/blaze_face_short_range.tflite` is missing, the demo will fail to start. Train Model 1 (or copy its provided checkpoint into `weights/`) first.
 
 ---
 
@@ -364,6 +326,6 @@ The same crop-tuning advice from Demo B applies verbatim (the encoder was traine
 4. Train Model 2 (RAVDESS / VGGStyleCNN128) — must finish before Models 3 and 5, because both warm-start their encoder from this checkpoint.
 5. Train Model 3 (CNN-LSTM warm-start + frozen), Model 4 (CNN-LSTM end-to-end), Model 5 (CNN-LSTM + subject-residue, pure), and Model 5b (CNN-LSTM + subject-residue, concat). Models 3, 5, and 5b all need the Model 2 checkpoint; Model 4 does not. All four are independent of each other and can run sequentially or in parallel.
 6. Run the matching `evaluation/eval_*.py` script for any trained model, or the zero-shot CLIP baseline, to reproduce the reported numbers and confusion matrices.
-7. (Optional) Run `demo/realtime_webcam_fer.py` (Model 3), `demo/realtime_webcam_model5.py` (Model 5, pure residue, with personal enrollment), or `demo/realtime_webcam_model5b.py` (Model 5b, residue-concat, with personal enrollment — recommended) for a live webcam sanity check.
+7. (Optional) Run `demo/realtime_webcam_fer.py` (Model 1, FER2013 ShallowCNN48) for a live webcam sanity check. See the known FER2013-specific caveats in the *Real time demo* section above.
 
 **If you only want to reproduce evaluation numbers, skip steps 3-5 and use the provid
