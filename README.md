@@ -328,4 +328,4 @@ Known limitations (honest caveats):
 6. Run the matching `evaluation/eval_*.py` script for any trained model, or the zero-shot CLIP baseline, to reproduce the reported numbers and confusion matrices.
 7. (Optional) Run `demo/realtime_webcam_fer.py` (Model 1, FER2013 ShallowCNN48) for a live webcam sanity check. See the known FER2013-specific caveats in the *Real time demo* section above.
 
-**If you only want to reproduce evaluation numbers, skip steps 3-5 and use the provid
+**If you only want to reproduce evaluation numbers, skip steps 3-5 and use the provided weights.**
